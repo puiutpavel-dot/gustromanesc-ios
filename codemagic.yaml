@@ -1,0 +1,97 @@
+workflows:
+  ios-build:
+    name: iOS build (simulator, no signing)
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      xcode: latest
+    scripts:
+      - name: Build for iOS Simulator
+        script: |
+          set -o pipefail
+          xcodebuild -project GustRomanesc.xcodeproj -scheme GustRomanesc -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | tee "$CM_BUILD_DIR/build.log" \
+          || { echo "===== ERRORS ====="; grep -E "error:" "$CM_BUILD_DIR/build.log" | sort -u | head -100; exit 1; }
+    artifacts:
+      - build.log
+
+  ios-setup:
+    name: Gust Românesc — Configurare (Bundle ID + profil App Store)
+    instance_type: mac_mini_m2
+    max_build_duration: 10
+    integrations:
+      app_store_connect: kino_ledger_asc_key
+    environment:
+      xcode: latest
+    scripts:
+      - name: Creează Bundle ID și profilul App Store pentru ro.draghicioiu.gustromanesc
+        script: |
+          set -e
+          BID=ro.draghicioiu.gustromanesc
+          find_bundle() {
+            app-store-connect bundle-ids list --bundle-id-identifier $BID --strict-match-identifier --json \
+              | python3 -c "import sys,json
+          d=json.load(sys.stdin)
+          print(d[0]['id'] if d else '')"
+          }
+          BUNDLE_RES=$(find_bundle)
+          if [ -z "$BUNDLE_RES" ]; then
+            echo "Creez Bundle ID $BID"
+            app-store-connect bundle-ids create $BID --name "Gust Romanesc" --platform IOS
+            BUNDLE_RES=$(find_bundle)
+          fi
+          echo "Bundle resource: $BUNDLE_RES"
+          EXISTING=$(app-store-connect profiles list --bundle-id-resource-id "$BUNDLE_RES" --type IOS_APP_STORE --json 2>/dev/null | python3 -c "import sys,json
+          try:
+              print(len(json.load(sys.stdin)))
+          except Exception:
+              print(0)")
+          if [ "$EXISTING" != "0" ]; then
+            echo "Profilul App Store există deja"
+            exit 0
+          fi
+          CERTS=""
+          for T in DISTRIBUTION IOS_DISTRIBUTION; do
+            IDS=$(app-store-connect certificates list --type $T --json 2>/dev/null | python3 -c "import sys,json
+          try:
+              print(' '.join(c['id'] for c in json.load(sys.stdin)))
+          except Exception:
+              pass")
+            CERTS="$CERTS $IDS"
+          done
+          CERTS=$(echo $CERTS)
+          echo "Certificates: $CERTS"
+          app-store-connect profiles create "$BUNDLE_RES" --certificate-ids $CERTS --type IOS_APP_STORE --name "Gust Romanesc App Store"
+
+  ios-testflight:
+    name: Gust Românesc — TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    integrations:
+      app_store_connect: kino_ledger_asc_key
+    environment:
+      xcode: latest
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: ro.draghicioiu.gustromanesc
+      vars:
+        XCODE_PROJECT: GustRomanesc.xcodeproj
+        XCODE_SCHEME: GustRomanesc
+    scripts:
+      - name: Aplică profilurile de semnare
+        script: xcode-project use-profiles --project "$XCODE_PROJECT"
+      - name: Număr de build
+        script: |
+          echo "Build number: $BUILD_NUMBER"
+          sed -i '' "s/CURRENT_PROJECT_VERSION = [0-9]*;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" "$XCODE_PROJECT/project.pbxproj"
+      - name: Build IPA
+        script: |
+          xcode-project build-ipa --project "$XCODE_PROJECT" --scheme "$XCODE_SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
